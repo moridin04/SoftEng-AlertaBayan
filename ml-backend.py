@@ -68,14 +68,17 @@ def calculate_indices(df):
     
     df['Vulnerability_Score'] = df['Pop_Density'].apply(get_vuln_score)
 
-    # Flood Risk Scores (Physical Risk - Based on Coverage Ratio)
+    # Flood Risk Scores (Physical Risk - TIGHTENED THRESHOLDS)
+    # Fixes the "Alarmist" bias by making it harder to get a 10.0 score
     def get_flood_score(flood_area, total_area):
         if pd.isna(total_area) or total_area == 0: return 0
         ratio = flood_area / total_area
-        if ratio >= 0.50: return 10.0
-        elif ratio >= 0.30: return 7.5
-        elif ratio >= 0.15: return 5.0
-        elif ratio > 0.0: return 2.5
+        
+        # Stricter Rules:
+        if ratio >= 0.80: return 10.0   # Only >80% coverage is "Very High"
+        elif ratio >= 0.50: return 7.5  # >50% is High
+        elif ratio >= 0.20: return 5.0  # >20% is Moderate
+        elif ratio > 0.05: return 2.5   # >5% is Low
         else: return 0.0
 
     # Calculate scores for DPI formula
@@ -126,6 +129,13 @@ def run_ml_pipeline(df):
     cluster_ranks = df.groupby("Cluster_Group")["DPI"].mean().sort_values().index
     risk_labels = {cluster_ranks[0]: "Low", cluster_ranks[1]: "Moderate", cluster_ranks[2]: "High"}
     df["ML_Risk_Class"] = df["Cluster_Group"].map(risk_labels)
+
+    # === HYBRID LOGIC OVERRIDE (Sanity Check) ===
+    # 1. If Physical Risk (CSI) is extreme (>9.0), Force HIGH RISK
+    df.loc[df['CSI'] >= 9.0, 'ML_Risk_Class'] = 'High'
+    
+    # 2. If Physical Risk is very low (<2.0), Force LOW RISK (Fixes Blue Ridge if data allows)
+    df.loc[df['CSI'] <= 2.0, 'ML_Risk_Class'] = 'Low'
 
     # VISUALIZATION: Generate K-Means Scatter Plot
     try:
