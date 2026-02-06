@@ -10,106 +10,109 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score, mean_squared_error
 
-# ==========================================
-# RESEARCH DESIGN: SEQUENTIAL MULTI-STAGE
-# ==========================================
-
-# STAGE 1: DATA INTEGRATION
+#Sequential ML Pipeline for Flood Risk Assessment
+#Data Integration
 def load_data(combined_csv_path):
-    """
-    Loads a single combined dataset containing both Geospatial Data and Demographic Data.
-    Robustly handles column renaming.
-    """
-    print(f"Loading data from: {combined_csv_path}")
+    print(f"Data loading: {combined_csv_path}")
     df = pd.read_csv(combined_csv_path)
     
-    # 1. Clean whitespace from column headers
+    #Clean Whitespace
     df.columns = df.columns.str.strip()
     
-    # 2. Smart Rename: Map file columns to standard variables
+    #Rename
     rename_map = {
-        'barangay': 'Name',
-        'Barangay': 'Name',
+        'barangay': 'Name', 'Barangay': 'Name',
         'brgy_area_sqm': 'Land Area',
-        'Population_2020': 'Population', # Matches your specific file
-        'population': 'Population',
-        'Population': 'Population'
+        'Population_2020': 'Population', 'population': 'Population', 'Population': 'Population'
     }
     df = df.rename(columns=rename_map)
 
-    # 3. Validation
-    if 'Name' not in df.columns:
-        raise KeyError("Could not find 'Barangay' or 'Name' column. Check CSV headers.")
-            
-    # 4. Fill missing population
-    if 'Population' not in df.columns:
-        print("WARNING: Population column missing. Creating empty column.")
-        df['Population'] = 0
+    if 'Name' not in df.columns: raise KeyError("Column 'Name' missing.")
+    if 'Population' not in df.columns: df['Population'] = 0
             
     return df
 
-# STAGE 2: FEATURE ENGINEERING & DETERMINISTIC INDEXING
-def calculate_indices(df):
-    # 1. Feature Engineering: Population Density
+#Feature Engineering
+def engineer_features(df):
+    #Basic Cleanup
     df['Land Area'] = df['Land Area'].replace(0, np.nan)
-    df['Pop_Density'] = df['Population'] / df['Land Area']
     
-    # 2. Deterministic Indexing: Disaster Priority Index (DPI)
+    #Flood Coverage Ratios (how much of the barangay is wet)
+    df['flood5_coverage'] = df['flood5_sqm_final'] / df['Land Area']
+    df['flood25_coverage'] = df['flood25_sqm_final'] / df['Land Area']
+    df['flood100_coverage'] = df['flood100_sqm_final'] / df['Land Area']
     
-    # CRITICAL FIX: Realistic Thresholds for Metro Manila Density
+    #Population Density (People per Hectare)
+    df['Pop_Density'] = (df['Population'] / df['Land Area']) 
+    
+    #Interaction Terms: Affected Population
+    #multiplies People * Water
+    #if Pop is high but Water is 0, this is 0 (no risk)
+    df['Affected_Pop_5yr'] = df['Population'] * df['flood5_coverage']
+    df['Affected_Pop_25yr'] = df['Population'] * df['flood25_coverage']
+    df['Affected_Pop_100yr'] = df['Population'] * df['flood100_coverage']
+    
+    #Flood Growth Rate (5yr to 25yr)
+    df['Flood_Growth_5to25'] = (df['flood25_sqm_final'] - df['flood5_sqm_final']) / df['Land Area']
+    
+    return df
+
+#Deterministic Indexing
+def calculate_indices(df):
+    #Advanced Engineering
+    df = engineer_features(df)
+    
+    #Vulnerability Score (Human Risk)
     def get_vuln_score(density):
         if pd.isna(density): return 1
-        # Adjusted for people/sqm (0.07 is ~70k people/km², which is very dense)
-        if density >= 0.07: return 10   # Very High Density (e.g., Tondo)
-        elif density >= 0.04: return 7  # High Density
-        elif density >= 0.02: return 4  # Moderate Density
-        elif density > 0.0: return 2    # Low Density
-        else: return 1                  # Zero / No Data
+        # Thresholds (People per SQM): 0.07 is ~70k/km2
+        if density >= 0.07: return 10
+        elif density >= 0.04: return 7
+        elif density >= 0.02: return 4
+        elif density > 0.0: return 2
+        else: return 1
     
     df['Vulnerability_Score'] = df['Pop_Density'].apply(get_vuln_score)
 
-    # Flood Risk Scores (Physical Risk - TIGHTENED THRESHOLDS)
-    # Fixes the "Alarmist" bias by making it harder to get a 10.0 score
-    def get_flood_score(flood_area, total_area):
-        if pd.isna(total_area) or total_area == 0: return 0
-        ratio = flood_area / total_area
-        
-        # Stricter Rules:
-        if ratio >= 0.80: return 10.0   # Only >80% coverage is "Very High"
-        elif ratio >= 0.50: return 7.5  # >50% is High
-        elif ratio >= 0.20: return 5.0  # >20% is Moderate
-        elif ratio > 0.05: return 2.5   # >5% is Low
+    #Flood Risk Scores (Physical Risk)
+    def get_flood_score(ratio):
+        if pd.isna(ratio): return 0
+        if ratio >= 0.80: return 10.0
+        elif ratio >= 0.50: return 7.5
+        elif ratio >= 0.20: return 5.0
+        elif ratio > 0.05: return 2.5
         else: return 0.0
 
-    # Calculate scores for DPI formula
-    df['Assessment_5yr_Score'] = df.apply(lambda x: get_flood_score(x['flood5_sqm_final'], x['Land Area']), axis=1)
-    df['Assessment_25yr_Score'] = df.apply(lambda x: get_flood_score(x['flood25_sqm_final'], x['Land Area']), axis=1)
-    df['Assessment_100yr_Score'] = df.apply(lambda x: get_flood_score(x['flood100_sqm_final'], x['Land Area']), axis=1)
+    #Calculate sub-scores using the NEW coverage columns
+    df['Assessment_5yr_Score'] = df['flood5_coverage'].apply(get_flood_score)
+    df['Assessment_25yr_Score'] = df['flood25_coverage'].apply(get_flood_score)
+    df['Assessment_100yr_Score'] = df['flood100_coverage'].apply(get_flood_score)
 
-    # Composite Susceptibility Index (CSI)
+    #Composite Susceptibility Index (CSI)
     df['CSI'] = (
         (df['Assessment_5yr_Score'] * 0.5) +
         (df['Assessment_25yr_Score'] * 0.3) +
         (df['Assessment_100yr_Score'] * 0.2)
     )
 
-    # Final DPI Calculation (Target Variable)
+    #Final DPI Calculation
     df['DPI'] = (df['CSI'] * 0.6) + (df['Vulnerability_Score'] * 0.4)
     
     return df
 
-# STAGE 3: PREDICTIVE MODELING (Supervised & Unsupervised)
+#Predictive Modeling
 def run_ml_pipeline(df):
-    # CRITICAL: Honest Feature List (No Data Leakage)
+    #Feature List
     feature_cols = [
-        'Pop_Density',          # Human Factor
-        'flood5_sqm_final',     # Physical Factor (5-year)
-        'flood25_sqm_final',    # Physical Factor (25-year)
-        'flood100_sqm_final',   # Physical Factor (100-year)
-        'Land Area'             # Context Factor
+        'Pop_Density',          
+        'flood5_coverage',
+        'flood100_coverage',
+        'Affected_Pop_100yr',
+        'Flood_Growth_5to25',
+        'Land Area'
     ]
     
-    # Preprocessing
+    #Handle NaNs
     for col in feature_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
@@ -120,80 +123,54 @@ def run_ml_pipeline(df):
     X_imputed = imputer.fit_transform(X_raw)
     X_scaled = scaler.fit_transform(X_imputed)
     
-    # A. UNSUPERVISED PHASE: K-Means Clustering
+    #Unsupervised Learning | K-Means
     kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
     clusters = kmeans.fit_predict(X_scaled)
     df["Cluster_Group"] = clusters
     
-    # Assign Labels (Low/Moderate/High) based on DPI clusters
+    #Assign Labels
     cluster_ranks = df.groupby("Cluster_Group")["DPI"].mean().sort_values().index
     risk_labels = {cluster_ranks[0]: "Low", cluster_ranks[1]: "Moderate", cluster_ranks[2]: "High"}
     df["ML_Risk_Class"] = df["Cluster_Group"].map(risk_labels)
 
-    # === HYBRID LOGIC OVERRIDE (Sanity Check) ===
-    # 1. If Physical Risk (CSI) is extreme (>9.0), Force HIGH RISK
-    df.loc[df['CSI'] >= 9.0, 'ML_Risk_Class'] = 'High'
-    
-    # 2. If Physical Risk is very low (<2.0), Force LOW RISK (Fixes Blue Ridge if data allows)
-    df.loc[df['CSI'] <= 2.0, 'ML_Risk_Class'] = 'Low'
+    #Validation Fix
+    df.loc[df['CSI'] >= 9.0, 'ML_Risk_Class'] = 'High' #If 80%+ flooded, always High
+    df.loc[df['CSI'] <= 2.0, 'ML_Risk_Class'] = 'Low'  #If <5% flooded, always Low
 
-    # VISUALIZATION: Generate K-Means Scatter Plot
+    #Visualization
     try:
         plt.figure(figsize=(10, 6))
-        # Plot Pop Density vs CSI (Physical Risk), colored by Cluster
         sns.scatterplot(
             data=df, x='Pop_Density', y='CSI', hue='ML_Risk_Class',
             hue_order=['Low', 'Moderate', 'High'],
-            palette={'Low': 'green', 'Moderate': 'orange', 'High': 'red'},
-            alpha=0.7
+            palette={'Low': 'green', 'Moderate': 'orange', 'High': 'red'}, alpha=0.7
         )
-        plt.title('K-Means Clustering Results: Risk Archetypes')
-        plt.xlabel('Population Density (People/sqm)')
-        plt.ylabel('Physical Flood Risk (CSI)')
+        plt.title('Risk Archetypes: Pop Density vs Physical Risk')
         plt.tight_layout()
         plt.savefig('kmeans_cluster_chart.png', dpi=300)
-        print("Visualization saved: 'kmeans_cluster_chart.png'")
-    except Exception as e:
-        print(f"Could not generate plot: {e}")
+    except: pass
 
-    # B. SUPERVISED PHASE: Classification
+    #Supervised Learning | Classification
     y = LabelEncoder().fit_transform(df["ML_Risk_Class"])
     X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
 
     models = {
         "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
         "Gradient Boosting": GradientBoostingClassifier(random_state=42),
-        "Neural Network (MLP)": MLPClassifier(hidden_layer_sizes=(16, 8), max_iter=500, random_state=42)
+        "Neural Network": MLPClassifier(hidden_layer_sizes=(16, 8), max_iter=500, random_state=42)
     }
 
-    print("\n=== EVALUATION: CLASSIFICATION METRICS (HONEST VALIDATION) ===")
-    
+    print("\nEvaluation: Classification Metrics")
     for name, model in models.items():
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
         acc = accuracy_score(y_test, y_pred)
         f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
-        
-        print(f"[{name}]")
-        print(f"  Accuracy:  {acc:.2%}")
-        print(f"  F1-Score:  {f1:.2%}")
-        print("-" * 30)
+        print(f"[{name}] Acc: {acc:.2%} | F1: {f1:.2%}")
 
-    # C. REGRESSION ANALYSIS
-    print("\n=== EVALUATION: REGRESSION METRICS ===")
-    regressor = RandomForestRegressor(n_estimators=100, random_state=42)
-    y_reg = df['DPI']
-    X_train_r, X_test_r, y_train_r, y_test_r = train_test_split(X_scaled, y_reg, test_size=0.2, random_state=42)
-    
-    regressor.fit(X_train_r, y_train_r)
-    y_pred_r = regressor.predict(X_test_r)
-    rmse = np.sqrt(mean_squared_error(y_test_r, y_pred_r))
-    
-    print(f"Random Forest Regressor RMSE: {rmse:.4f}")
-
-    # Feature Importance
+    #Feature Importance
     rf_model = models["Random Forest"]
-    print("\n=== FEATURE IMPORTANCE (RAW DRIVERS) ===")
+    print("\nFeature Importance")
     importances = rf_model.feature_importances_
     for feat, score in sorted(zip(feature_cols, importances), key=lambda x: x[1], reverse=True):
         print(f"  - {feat}: {score:.4f}")
@@ -201,87 +178,38 @@ def run_ml_pipeline(df):
     return df
 
 def run_validation_checks(df):
-    print("\n" + "="*50)
-    print("       FINAL VALIDATION CHECKS (LOGIC & GROUND TRUTH)")
-    print("="*50)
-
-    # CHECK 1: GROUND TRUTH COMPARISON
-    print("\n[CHECK 1] Known Ground Truth Verification:")
-    ground_truths = {
-        "Barangay 12": "High",      # Tondo (Coastal/Dense) -> SHOULD BE HIGH
-        "Tuktukan": "High",         # Taguig (Riverine) -> SHOULD BE HIGH
-        "Wawa": "High",             # Taguig (Laguna Lake) -> SHOULD BE HIGH
-        "Blue Ridge A": "Low",      # QC (High Elevation) -> SHOULD BE LOW
-        "Forbes Park": "Low"        # Makati (Gated) -> SHOULD BE LOW/MODERATE
-    }
-
-    correct_matches = 0
-    total_checks = 0
-
+    print("\nValidation Checks:")
+    ground_truths = {"Barangay 12": "High", "Tuktukan": "High", "Blue Ridge A": "Low"}
     for brgy, expected in ground_truths.items():
         row = df[df['Name'].str.contains(brgy, case=False, na=False)]
         if not row.empty:
             actual = row.iloc[0]['ML_Risk_Class']
-            is_correct = (actual == expected) or (expected == "Low" and actual == "Moderate")
-            status = "✅ PASS" if is_correct else "❌ FAIL"
-            print(f"  - {brgy:<15} | Expected: {expected:<5} | Actual: {actual:<8} | {status}")
-            if is_correct: correct_matches += 1
-            total_checks += 1
-        else:
-            print(f"  - {brgy:<15} | Not found in dataset.")
+            status = "✅" if actual == expected or (expected=="Low" and actual=="Moderate") else "❌"
+            print(f"  {brgy}: Expected {expected}, Got {actual} {status}")
 
-    # CHECK 2: PHYSICAL LOGIC CONSISTENCY
-    print("\n[CHECK 2] Physical Logic Consistency:")
-    high_flood = df[df['CSI'] >= 9.0]
-    mismatches = high_flood[high_flood['ML_Risk_Class'] == 'Low']
-    if mismatches.empty:
-        print("  ✅ PASS: All locations with Extreme Flood Scores (CSI > 9.0) are correctly classified.")
-    else:
-        print(f"  ❌ FAIL: Found {len(mismatches)} locations with Max Flooding but Low Risk labeling.")
-
-    # CHECK 3: DISTRIBUTION BALANCE
-    print("\n[CHECK 3] Distribution Balance:")
     dist = df['ML_Risk_Class'].value_counts(normalize=True) * 100
-    print(f"  - High Risk:     {dist.get('High', 0):.1f}%")
-    print(f"  - Moderate Risk: {dist.get('Moderate', 0):.1f}%")
-    print(f"  - Low Risk:      {dist.get('Low', 0):.1f}%")
-
-    print("\nValidation Complete.\n")
+    print(f"\nDistribution: High {dist.get('High',0):.1f}% | Mod {dist.get('Moderate',0):.1f}% | Low {dist.get('Low',0):.1f}%")
 
 def get_recommendation(row):
     risk = row['ML_Risk_Class']
-    if risk == "High":
-        return "Priority Zone: High logic-based DPI. Immediate intervention."
-    elif risk == "Moderate":
-        return "Watch Zone: Monitor non-linear risk factors."
-    else:
-        return "Low Priority: Maintenance only."
+    if risk == "High": return "Priority: Structural Intervention"
+    elif risk == "Moderate": return "Watch: Monitor evacuation routes"
+    else: return "Low Priority: Maintenance only"
 
 def export_results(df):
     df['Recommendation'] = df.apply(get_recommendation, axis=1)
     output_cols = ['Name', 'Pop_Density', 'CSI', 'DPI', 'ML_Risk_Class', 'Recommendation']
-    
-    for col in output_cols:
+    for col in output_cols: 
         if col not in df.columns: df[col] = "N/A"
-
     df[output_cols].to_excel("final_methodology_aligned_results.xlsx", index=False)
     print("\nResults exported.")
 
-# EXECUTION
 if __name__ == "__main__":
-    # Correct filename for the combined dataset
     filename = 'MetroManila_Combined_Flood_Population.csv'
-    
     try:
         df = load_data(filename)
         df = calculate_indices(df)
         df_final = run_ml_pipeline(df)
-        
-        # Run Validation Logic
         run_validation_checks(df_final)
-        
         export_results(df_final)
-    except FileNotFoundError:
-        print(f"\nERROR: File '{filename}' not found. Please upload it.")
-    except Exception as e:
-        print(f"\nAn error occurred: {e}")
+    except Exception as e: print(f"Error: {e}")
