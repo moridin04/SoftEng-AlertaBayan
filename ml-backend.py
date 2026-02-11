@@ -5,10 +5,23 @@ import matplotlib.pyplot as plt
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.cluster import KMeans
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, RandomForestRegressor
-from sklearn.neural_network import MLPClassifier
+from sklearn.ensemble import (
+    GradientBoostingClassifier,
+    GradientBoostingRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score, mean_squared_error
+from sklearn.neural_network import MLPClassifier, MLPRegressor
+from sklearn.metrics import (
+    accuracy_score,
+    adjusted_rand_score,
+    calinski_harabasz_score,
+    davies_bouldin_score,
+    f1_score,
+    mean_squared_error,
+    silhouette_score,
+)
 from fpdf import FPDF, XPos, YPos
 
 #Sequential ML Pipeline for Flood Risk Assessment in Metro Manila
@@ -134,79 +147,184 @@ def run_ml_pipeline(df):
     X_imputed = imputer.fit_transform(X_raw)
     X_scaled = scaler.fit_transform(X_imputed)
     
-    #Unsupervised Learning | K-Means
+    #Deterministic Benchmarking Target ("Ground Truth"): DPI-derived risk class
+    #These thresholds can be adjusted to match your paper's stated cutoffs.
+    def dpi_to_risk_class(dpi_score):
+        if pd.isna(dpi_score):
+            return "Low"
+        if dpi_score >= 6.5:
+            return "High"
+        if dpi_score >= 3.5:
+            return "Moderate"
+        return "Low"
+
+    df["DPI_Risk_Class"] = df["DPI"].apply(dpi_to_risk_class)
+    #Backwards-compatible alias used across exports/PDF
+    df["ML_Risk_Class"] = df["DPI_Risk_Class"]
+
+    #Unsupervised Phase | K-Means for exploratory "Risk Archetypes" (not labels)
     kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
     clusters = kmeans.fit_predict(X_scaled)
     df["Cluster_Group"] = clusters
-    
-    #Assign Labels
-    cluster_ranks = df.groupby("Cluster_Group")["DPI"].mean().sort_values().index
-    risk_labels = {cluster_ranks[0]: "Low", cluster_ranks[1]: "Moderate", cluster_ranks[2]: "High"}
-    df["ML_Risk_Class"] = df["Cluster_Group"].map(risk_labels)
-    
-    #Fix False Lows
-    df.loc[(df['CSI'] >= 6.0) & (df['ML_Risk_Class'] == 'Low'), 'ML_Risk_Class'] = 'Moderate' # If CSI is high but classified Low, upgrade to Moderate
-    df.loc[(df['DPI'] >= 5.0) & (df['DPI'] < 6.5), 'ML_Risk_Class'] = 'Moderate' # If DPI is moderate but classified Low, upgrade to Moderate
 
-    #Validation Fix
-    df.loc[df['CSI'] >= 8.0, 'ML_Risk_Class'] = 'High' # If 80%+ flooded, always High
-    df.loc[df['CSI'] <= 2.0, 'ML_Risk_Class'] = 'Low'  # If <5% flooded, always Low
+    #Simple archetype naming based on cluster means (density vs exposure)
+    try:
+        cluster_means = df.groupby('Cluster_Group')[['Pop_Density', 'flood100_coverage']].mean(numeric_only=True)
+        density_median = cluster_means['Pop_Density'].median()
+        exposure_median = cluster_means['flood100_coverage'].median()
+        archetype_map = {}
+        for group, row in cluster_means.iterrows():
+            density_tag = "HighDensity" if row['Pop_Density'] >= density_median else "LowDensity"
+            exposure_tag = "HighExposure" if row['flood100_coverage'] >= exposure_median else "LowExposure"
+            archetype_map[group] = f"{density_tag}-{exposure_tag}"
+        df['Risk_Archetype'] = df['Cluster_Group'].map(archetype_map)
+    except Exception:
+        df['Risk_Archetype'] = df['Cluster_Group'].astype(str)
 
-    #Visualization
+    #Visualization (Archetypes)
     try:
         plt.figure(figsize=(10, 6))
         sns.scatterplot(
-            data=df, x='Pop_Density', y='CSI', hue='ML_Risk_Class',
-            hue_order=['Low', 'Moderate', 'High'],
-            palette={'Low': 'green', 'Moderate': 'orange', 'High': 'red'}, alpha=0.7
+            data=df, x='Pop_Density', y='CSI', hue='Risk_Archetype', alpha=0.7
         )
-        plt.title('Risk Archetypes: Pop Density vs Physical Risk')
+        plt.title('Risk Archetypes (K-Means): Pop Density vs Physical Risk')
         plt.tight_layout()
         plt.savefig('kmeans_cluster_chart.png', dpi=300)
     except: pass
 
-    #Supervised Learning | Classification
-    y = LabelEncoder().fit_transform(df["ML_Risk_Class"])
-    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+    #Unsupervised diagnostics (for reporting)
+    print("\nUnsupervised Phase - K-Means Diagnostics")
+    try:
+        sil = silhouette_score(X_scaled, clusters)
+        db = davies_bouldin_score(X_scaled, clusters)
+        ch = calinski_harabasz_score(X_scaled, clusters)
+        print(f"  Silhouette: {sil:.4f} (higher better)")
+        print(f"  Davies-Bouldin: {db:.4f} (lower better)")
+        print(f"  Calinski-Harabasz: {ch:.2f} (higher better)")
+    except Exception as e:
+        print(f"  Could not compute clustering diagnostics: {e}")
 
-    models = {
-        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
+    try:
+        baseline = clusters
+        ari_scores = []
+        for seed in range(10):
+            km = KMeans(n_clusters=3, random_state=seed, n_init=10)
+            alt = km.fit_predict(X_scaled)
+            ari_scores.append(adjusted_rand_score(baseline, alt))
+        print(f"  Stability (ARI vs seed=42, 10 seeds): mean={np.mean(ari_scores):.3f} | min={np.min(ari_scores):.3f}")
+    except Exception as e:
+        print(f"  Could not compute stability: {e}")
+
+    #Supervised Phase - Benchmarking (classification + regression)
+    y_class = LabelEncoder().fit_transform(df["DPI_Risk_Class"].astype(str))
+    y_reg = df["DPI"].astype(float).to_numpy()
+
+    X_train, X_test, y_class_train, y_class_test, y_reg_train, y_reg_test = train_test_split(
+        X_scaled,
+        y_class,
+        y_reg,
+        test_size=0.2,
+        random_state=42,
+        stratify=y_class,
+    )
+
+    clf_models = {
+        "Random Forest": RandomForestClassifier(n_estimators=200, random_state=42),
         "Gradient Boosting": GradientBoostingClassifier(random_state=42),
-        "Neural Network": MLPClassifier(hidden_layer_sizes=(16, 8), max_iter=2000, random_state=42)
+        "Neural Network (MLP)": MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=3000, random_state=42),
     }
 
-    print("\nEvaluation - Classification Metrics")
-    for name, model in models.items():
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-        acc = accuracy_score(y_test, y_pred)
-        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
-        print(f"[{name}] Acc: {acc:.2%} | F1: {f1:.2%}")
+    reg_models = {
+        "Random Forest": RandomForestRegressor(n_estimators=200, random_state=42),
+        "Gradient Boosting": GradientBoostingRegressor(random_state=42),
+        "Neural Network (MLP)": MLPRegressor(hidden_layer_sizes=(32, 16), max_iter=3000, random_state=42),
+    }
 
-    #Feature Importance
-    rf_model = models["Random Forest"]
-    print("\nFeature Importance")
-    importances = rf_model.feature_importances_
-    for feat, score in sorted(zip(feature_cols, importances), key=lambda x: x[1], reverse=True):
-        print(f"  - {feat}: {score:.4f}")
+    print("\nSupervised Phase - Classification (target: DPI_Risk_Class)")
+    clf_results = {}
+    for name, model in clf_models.items():
+        model.fit(X_train, y_class_train)
+        y_pred = model.predict(X_test)
+        acc = accuracy_score(y_class_test, y_pred)
+        f1 = f1_score(y_class_test, y_pred, average='weighted', zero_division=0)
+        clf_results[name] = {"acc": acc, "f1": f1, "model": model}
+        print(f"  [{name}] Acc: {acc:.2%} | F1: {f1:.2%}")
+
+    print("\nSupervised Phase - Regression (target: DPI score)")
+    reg_results = {}
+    for name, model in reg_models.items():
+        model.fit(X_train, y_reg_train)
+        y_pred = model.predict(X_test)
+        rmse = float(np.sqrt(mean_squared_error(y_reg_test, y_pred)))
+        reg_results[name] = {"rmse": rmse, "model": model}
+        print(f"  [{name}] RMSE: {rmse:.4f}")
+
+    #Select best models for optional output columns
+    best_clf_name = max(clf_results.keys(), key=lambda n: clf_results[n]["f1"])
+    best_reg_name = min(reg_results.keys(), key=lambda n: reg_results[n]["rmse"])
+    best_clf = clf_results[best_clf_name]["model"]
+    best_reg = reg_results[best_reg_name]["model"]
+
+    print(f"\nBest Classifier (by F1): {best_clf_name}")
+    print(f"Best Regressor (by RMSE): {best_reg_name}")
+
+    #Add predictions to dataframe (proof-of-concept outputs)
+    try:
+        full_pred_class = best_clf.predict(X_scaled)
+        full_pred_dpi = best_reg.predict(X_scaled)
+        le = LabelEncoder().fit(df["DPI_Risk_Class"].astype(str))
+        df["Predicted_Risk_Class"] = le.inverse_transform(full_pred_class.astype(int))
+        df["Predicted_DPI"] = np.clip(full_pred_dpi, 0, 10)
+    except Exception:
+        pass
+
+    #Feature importance (interpretable models)
+    print("\nFeature Importance (Random Forest)")
+    try:
+        rf_model = clf_models["Random Forest"]
+        importances = rf_model.feature_importances_
+        for feat, score in sorted(zip(feature_cols, importances), key=lambda x: x[1], reverse=True):
+            print(f"  - {feat}: {score:.4f}")
+    except Exception as e:
+        print(f"  Could not compute feature importance: {e}")
 
     return df
 
 def run_validation_checks(df):
-    print("\nValidation Checks")
-    ground_truths = {"Barangay 12": "High", "Tuktukan": "High", "Blue Ridge A": "Low"}
-    for brgy, expected in ground_truths.items():
-        row = df[df['Name'].str.contains(brgy, case=False, na=False)]
-        if not row.empty:
-            actual = row.iloc[0]['ML_Risk_Class']
-            status = "Yes" if actual == expected or (expected=="Low" and actual=="Moderate") else "No"
-            print(f"  {brgy}: Expected {expected}, Got {actual} {status}")
-
+    print("\nValidation & Consistency Checks")
+    print("  Note: DPI is treated as the deterministic baseline label (experimental ground truth).")
     dist = df['ML_Risk_Class'].value_counts(normalize=True) * 100
-    print(f"\nDistribution: High {dist.get('High',0):.1f}% | Mod {dist.get('Moderate',0):.1f}% | Low {dist.get('Low',0):.1f}%")
+    print(f"  DPI Risk Distribution: High {dist.get('High',0):.1f}% | Mod {dist.get('Moderate',0):.1f}% | Low {dist.get('Low',0):.1f}%")
+
+    #Domain logic consistency checks (example locations; matches your methodology narrative)
+    print("\n  Domain Logic Consistency (examples)")
+    checks = {
+        "Barangay 12": "High",
+        "Tuktukan": "High",
+        "Blue Ridge": "Low",
+        "Tondo": "High",
+        "Taguig": "High",
+    }
+    for needle, expected in checks.items():
+        row = df[df['Name'].astype(str).str.contains(needle, case=False, na=False)]
+        if row.empty:
+            continue
+        r = row.iloc[0]
+        actual = r.get('DPI_Risk_Class', r.get('ML_Risk_Class', 'N/A'))
+        dpi_val = r.get('DPI', np.nan)
+        csi_val = r.get('CSI', np.nan)
+        ok = (actual == expected) or (expected == "Low" and actual == "Moderate")
+        print(f"    {r['Name']}: Expected {expected} | Got {actual} | DPI={dpi_val:.2f} | CSI={csi_val:.2f} | Pass={ok}")
+
+    try:
+        top = df.sort_values('DPI', ascending=False).head(5)[['Name', 'City', 'DPI', 'CSI', 'DPI_Risk_Class']]
+        print("\n  Top 5 by DPI")
+        print(top.to_string(index=False))
+    except Exception:
+        pass
 
 def get_recommendation(row):
-    risk = row['ML_Risk_Class']
+    risk = row.get('DPI_Risk_Class', row.get('ML_Risk_Class', 'Low'))
     if risk == "High":
         return "Priority Zone: High logic-based DPI. Immediate intervention."
     elif risk == "Moderate":
@@ -216,7 +334,18 @@ def get_recommendation(row):
 
 def export_results(df):
     df['Recommendation'] = df.apply(get_recommendation, axis=1)
-    output_cols = ['Name', 'Pop_Density', 'CSI', 'DPI', 'ML_Risk_Class', 'Recommendation']
+    output_cols = [
+        'Name',
+        'Pop_Density',
+        'CSI',
+        'DPI',
+        'DPI_Risk_Class',
+        'ML_Risk_Class',
+        'Risk_Archetype',
+        'Predicted_Risk_Class',
+        'Predicted_DPI',
+        'Recommendation',
+    ]
     
     for col in output_cols:
         if col not in df.columns: df[col] = "N/A"
@@ -272,7 +401,7 @@ def generate_pdf_report(df):
             #Table Header
             pdf.set_font("Helvetica", style="B", size=10)
             pdf.cell(60, 10, "Location", 1)
-            pdf.cell(30, 10, "Risk Class", 1)
+            pdf.cell(30, 10, "DPI Class", 1)
             pdf.cell(100, 10, "Recommendation", 1)
             pdf.ln()
 
@@ -285,7 +414,7 @@ def generate_pdf_report(df):
                 rec = (str(row['Recommendation'])[:55] + '..') if len(str(row['Recommendation'])) > 55 else str(row['Recommendation'])
                 
                 pdf.cell(60, 10, name, 1)
-                pdf.cell(30, 10, str(row['ML_Risk_Class']), 1)
+                pdf.cell(30, 10, str(row.get('DPI_Risk_Class', row.get('ML_Risk_Class', 'N/A'))), 1)
                 pdf.cell(100, 10, rec, 1)
                 pdf.ln()
             
