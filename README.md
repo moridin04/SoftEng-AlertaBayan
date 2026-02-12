@@ -1,4 +1,4 @@
-# SoftEng–AlertaBayan — Flood Risk Modeling (Final Submission)
+# SoftEng–AlertaBayan — Flood Risk Modeling
 
 This repository contains the **barangay-level flood risk modeling workflow** used for analysis and reporting, including the notebook, a companion Python script, the methodology write-up, and the generated visualizations.
 
@@ -16,13 +16,13 @@ This repository contains the **barangay-level flood risk modeling workflow** use
 ```bash
 pip install -r requirements.txt
 ```
-2) Run the analysis
+### 2) Run the analysis
 Notebook: open barangay_flood_risk_modeling.ipynb and run all cells, or
 Script: 
 ```bash
 python barangay_flood_risk_modeling.py
 ```
 
-Reproducibility notes
+## Reproducibility notes
 Some results can vary slightly across machines due to library versions and randomness (where applicable).
 This repo includes the final outputs used for submission (PDF/XLSX and key plots) for transparency.
